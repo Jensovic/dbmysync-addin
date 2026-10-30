@@ -1,0 +1,101 @@
+name: Release
+
+# Run manually from main (Actions tab, "Run workflow"). Validates commit
+# subjects, bumps the version with git-cliff, updates CHANGELOG.md, tags and
+# publishes a GitHub Release.
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      # Last commit that predates the Conventional Commits rule; it and its
+      # ancestors are not validated. Never needs to change.
+      LEGACY_BASE: 144e088
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate commit subjects since the last tag
+        run: |
+          last_tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          range="${last_tag:+${last_tag}..}HEAD"
+          types='feat|fix|perf|refactor|revert|docs|style|test|build|ci|chore'
+          bad="$(git log --no-merges --format='%h %s' "$range" --not "$LEGACY_BASE" \
+            | grep -Ev "^[0-9a-f]+ (${types})(\([^)]+\))?!?: .+" || true)"
+          if [ -n "$bad" ]; then
+            echo "These commits are not Conventional Commits (<type>(scope)?(!)?: <description>):" >&2
+            echo "$bad" >&2
+            exit 1
+          fi
+
+      - name: Compute next version
+        id: next
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --bumped-version
+
+      - name: Collect unreleased changes
+        id: unreleased
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --unreleased --strip all
+
+      - name: Check there is something to release
+        env:
+          VERSION: ${{ steps.next.outputs.content }}
+          UNRELEASED: ${{ steps.unreleased.outputs.content }}
+        run: |
+          if [ -z "$(printf '%s' "$UNRELEASED" | tr -d '[:space:]')" ]; then
+            echo "No releasable changes (feat/fix/perf/refactor/revert) since the last tag." >&2
+            exit 1
+          fi
+          version="$(printf '%s' "$VERSION" | tr -d '[:space:]')"
+          if git rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
+            echo "Tag ${version} already exists. Nothing was changed." >&2
+            exit 1
+          fi
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+
+      - name: Regenerate CHANGELOG.md
+        uses: orhun/git-cliff-action@v4
+        env:
+          OUTPUT: CHANGELOG.md
+        with:
+          config: cliff.toml
+          args: --tag ${{ env.VERSION }}
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "chore(release): ${VERSION}"
+          git tag "${VERSION}"
+
+      - name: Render release notes
+        id: notes
+        uses: orhun/git-cliff-action@v4
+        env:
+          OUTPUT: RELEASE_NOTES.md
+        with:
+          config: cliff.toml
+          args: --latest --strip all
+
+      - name: Push and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push --atomic origin HEAD:main "${VERSION}"
+          gh release create "${VERSION}" --title "${VERSION}" --notes-file RELEASE_NOTES.md
